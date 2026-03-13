@@ -2,8 +2,8 @@ name: generate animation
 
 on:
   schedule:
-    - cron: "0 */24 * * *"   # 每天執行一次
-  workflow_dispatch:           # 允許手動觸發
+    - cron: "0 0 * * *"   # 每天 UTC 00:00 執行
+  workflow_dispatch:
   push:
     branches:
       - main
@@ -13,18 +13,71 @@ jobs:
     permissions:
       contents: write
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
-      - name: generate github-contribution-grid-snake.svg
-        uses: Platane/snk/svg-only@v3
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          github_user_name: ${{ github.repository_owner }}
-          outputs: |
-            dist/github-contribution-grid-snake.svg
-            dist/github-contribution-grid-snake-dark.svg?palette=github-dark
+          node-version: '20'
 
-      - name: push github-contribution-grid-snake.svg to the output branch
+      - name: Download snk svg-only dist bundle
+        run: |
+          mkdir -p snk-dist
+          for f in index.js 324.index.js 578.index.js 642.index.js; do
+            curl -fsSL \
+              "https://raw.githubusercontent.com/Platane/snk/v3/svg-only/dist/$f" \
+              -o "snk-dist/$f"
+          done
+
+      - name: Inject date-range interceptor (trailing 12 months)
+        run: |
+          cat > snk-dist/fetch-interceptor.mjs << 'EOF'
+          // Override global fetch to inject explicit from/to dates into the
+          // contributionsCollection GraphQL query (snk uses the default which
+          // returns the account anniversary year, not a rolling 12 months).
+          const from = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString();
+          const to   = new Date().toISOString();
+
+          const _fetch = globalThis.fetch;
+          globalThis.fetch = async (url, opts = {}) => {
+            if (typeof url === 'string' && url.includes('api.github.com/graphql')) {
+              try {
+                const body = JSON.parse(opts.body);
+                if (body.query?.includes('contributionsCollection')) {
+                  body.query = body.query
+                    .replace(
+                      'query ($login: String!)',
+                      'query ($login: String!, $from: DateTime!, $to: DateTime!)'
+                    )
+                    .replace(
+                      'contributionsCollection {',
+                      'contributionsCollection(from: $from, to: $to) {'
+                    );
+                  body.variables = { ...body.variables, from, to };
+                  opts = { ...opts, body: JSON.stringify(body) };
+                  console.log(`[date-patch] ${from.slice(0,10)} → ${to.slice(0,10)}`);
+                }
+              } catch (_) {}
+            }
+            return _fetch(url, opts);
+          };
+          EOF
+
+      - name: Generate snake SVGs
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          DIST="$GITHUB_WORKSPACE/dist"
+          cd snk-dist
+          INPUT_GITHUB_USER_NAME=pekkachiu \
+          INPUT_OUTPUTS="$(printf '%s\n%s' \
+            "$DIST/github-contribution-grid-snake.svg" \
+            "$DIST/github-contribution-grid-snake-dark.svg?palette=github-dark")" \
+          node --import ./fetch-interceptor.mjs index.js
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push to output branch
         uses: crazy-max/ghaction-github-pages@v3.1.0
         with:
           target_branch: output
